@@ -59,7 +59,11 @@ func main() {
 		panic(err)
 	}
 
-	cache := Cache{client: rdb, expiry: 15 * time.Minute}
+	cachePeriod, err := time.ParseDuration(os.Getenv("CACHE_PERIOD"))
+	if err != nil {
+		panic(err)
+	}
+	cache := Cache{client: rdb, expiry: cachePeriod}
 
 	udpAddress := os.Getenv("ADDRESS")
 	// Listen for incoming UDP packets
