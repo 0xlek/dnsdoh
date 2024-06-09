@@ -145,11 +145,12 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 	if dohResponse == nil {
 		// Forward the DNS query to the DoH server
 		dohResponse, err = queryDoH(dnsQuery)
-		cache.Set(cacheKey, &dohResponse)
 		if err != nil {
 			fmt.Printf("Error querying DoH server: %v\n", err)
 			return
 		}
+
+		cache.Set(cacheKey, &dohResponse)
 	} else {
 		dohResponse = SetMsgId(dohResponse, GetMsgId(buf))
 	}
