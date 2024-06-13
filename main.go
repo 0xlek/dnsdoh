@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -150,7 +151,8 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 			return
 		}
 
-		shouldReplace, _ := shouldReplaceIP(dohResponse, []string{os.Getenv("IP_TO_CATCH")})
+		ips := strings.Split(os.Getenv("IP_TO_CATCH"), ",")
+		shouldReplace, _ := shouldReplaceIP(dohResponse, ips)
 		if shouldReplace {
 			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
 		}
