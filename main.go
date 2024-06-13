@@ -26,7 +26,7 @@ func (c *Cache) Get(name string) []byte {
 	msg, err := c.client.Get(context.Background(), name).Bytes()
 
 	if err != nil {
-		fmt.Println("miss cache ", name)
+		log.Println("miss cache ", name)
 		return nil
 	}
 
@@ -37,7 +37,7 @@ func (c *Cache) Set(name string, response *[]byte) {
 	err := c.client.Set(context.Background(), name, *response, c.expiry).Err()
 
 	if err != nil {
-		fmt.Println("failed to cache")
+		log.Println("failed to cache")
 	}
 }
 
@@ -70,13 +70,17 @@ func main() {
 	// Listen for incoming UDP packets
 	pc, err := net.ListenPacket("udp", udpAddress)
 	if err != nil {
-		fmt.Printf("Error starting UDP listener: %v\n", err)
+		log.Printf("Error starting UDP listener: %v\n", err)
 		return
 	}
 
 	defer pc.Close()
 
-	fmt.Printf("Listening on %s\n", udpAddress)
+	if os.Getenv("REFRESH_INSTANCE") == "true" {
+		go httpCacheRefresh(&cache)
+	}
+
+	log.Printf("Listening on %s\n", udpAddress)
 	for {
 		handleClient(pc, &cache)
 	}
@@ -87,7 +91,7 @@ func GetDnsQuery(msg []byte) string {
 	err := packet.Unpack(msg)
 
 	if err != nil {
-		fmt.Println("failed to unpack buffer to a msg struct")
+		log.Println("failed to unpack buffer to a msg struct")
 		return ""
 	}
 
@@ -104,7 +108,7 @@ func GetMsgId(msg []byte) uint16 {
 	err := packet.Unpack(msg)
 
 	if err != nil {
-		fmt.Println("failed to unpack message")
+		log.Println("failed to unpack message")
 		return 0
 	}
 
@@ -134,7 +138,7 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 	n, addr, err := pc.ReadFrom(buf)
 
 	if err != nil {
-		fmt.Printf("Error reading UDP packet: %v\n", err)
+		log.Printf("Error reading UDP packet: %v\n", err)
 		return
 	}
 
@@ -142,12 +146,13 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 	dnsQuery := buf[:n]
 	cacheKey := GetDnsQuery(buf)
 	dohResponse := cache.Get(cacheKey)
+	go logHistory(dohResponse)
 
 	if dohResponse == nil {
 		// Forward the DNS query to the DoH server
 		dohResponse, err = queryDoH(dnsQuery)
 		if err != nil {
-			fmt.Printf("Error querying DoH server: %v\n", err)
+			log.Printf("Error querying DoH server: %v\n", err)
 			return
 		}
 
@@ -211,7 +216,7 @@ func answerWith(msg []byte, ip string) []byte {
 
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
-		fmt.Println("Invalid custom IP address:", ip)
+		log.Println("Invalid custom IP address:", ip)
 		return msg
 	}
 
@@ -258,4 +263,112 @@ func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func httpCacheRefresh(cache *Cache) {
+	recordHandler := func(w http.ResponseWriter, req *http.Request) {
+		q := req.URL.Query()
+		name := q.Get("name")
+		qtype := q.Get("type")
+
+		if name == "" || qtype == "" {
+			log.Println("Invalid url, cache refresh skipped.")
+			return
+		}
+
+		msg := new(dns.Msg)
+
+		intQType, err := stringToType(qtype)
+		if err != nil {
+			log.Println("Wrong query type", err)
+			return
+		}
+		// Set the DNS message header
+		msg.SetQuestion(dns.Fqdn(name), intQType)
+
+		// Optional: Set the message ID, recursion desired, etc.
+		msg.Id = dns.Id()
+		msg.RecursionDesired = true
+		packedMsg, err := msg.Pack()
+		if err != nil {
+			log.Println("Could not pack the query msg", err)
+			return
+		}
+
+		dohResponse, err := queryDoH(packedMsg)
+		if err != nil {
+			log.Println("Failed to query DoH ", err)
+			return
+		}
+
+		ips := strings.Split(os.Getenv("IP_TO_CATCH"), ",")
+		shouldReplace, _ := shouldReplaceIP(dohResponse, ips)
+		if shouldReplace {
+			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
+		}
+
+		cacheKey := GetDnsQuery(dohResponse)
+		cache.Set(cacheKey, &dohResponse)
+		log.Println("Updated successfully " + name)
+		fmt.Fprintf(w, "Updated successfully %s", name)
+	}
+
+	http.HandleFunc("/refresh", recordHandler)
+
+	log.Printf("Listening on %s\n", "0.0.0.0:8083")
+	log.Fatal(http.ListenAndServe(":8083", nil))
+}
+
+func stringToType(qtype string) (uint16, error) {
+	switch qtype {
+	case "A":
+		return dns.TypeA, nil
+	case "AAAA":
+		return dns.TypeAAAA, nil
+	case "CNAME":
+		return dns.TypeCNAME, nil
+	case "MX":
+		return dns.TypeMX, nil
+	case "TXT":
+		return dns.TypeTXT, nil
+	case "NS":
+		return dns.TypeNS, nil
+	case "SOA":
+		return dns.TypeSOA, nil
+	case "PTR":
+		return dns.TypePTR, nil
+	default:
+		return 0, fmt.Errorf("unsupported query type: %s", qtype)
+	}
+}
+
+func logHistory(msg []byte) {
+	packet := new(dns.Msg)
+	err := packet.Unpack(msg)
+	if err != nil {
+		log.Println("Failed to unpack the message")
+	}
+
+	if len(packet.Question) == 0 {
+		log.Println("No questions in the DNS message")
+		return
+	}
+
+	question := packet.Question[0]
+	qname := question.Name
+	qtype := dns.TypeToString[question.Qtype]
+
+	historyLogURL := os.Getenv("HISTORY_URL")
+	req, err := http.NewRequest("GET", historyLogURL+"?name="+qname+"&type="+qtype, nil)
+	if err != nil {
+		log.Println("Could not build request for logging")
+		return
+	}
+
+	client := &http.Client{}
+	_, err = client.Do(req)
+	if err != nil {
+		log.Println("Failed to log to history " + qname)
+	}
+	log.Println("Logged to history " + qname)
 }
