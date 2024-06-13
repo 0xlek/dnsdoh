@@ -150,6 +150,11 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 			return
 		}
 
+		shouldReplace, _ := shouldReplaceIP(dohResponse, []string{os.Getenv("IP_TO_CATCH")})
+		if shouldReplace {
+			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
+		}
+
 		cache.Set(cacheKey, &dohResponse)
 	} else {
 		dohResponse = SetMsgId(dohResponse, GetMsgId(buf))
@@ -192,4 +197,63 @@ func queryDoH(dnsQuery []byte) ([]byte, error) {
 	}
 
 	return dohResponse, nil
+}
+
+func answerWith(msg []byte, ip string) []byte {
+	packet := new(dns.Msg)
+	err := packet.Unpack(msg)
+
+	if err != nil {
+		return msg
+	}
+
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		fmt.Println("Invalid custom IP address:", ip)
+		return msg
+	}
+
+	for i, answer := range packet.Answer {
+		if a, ok := answer.(*dns.A); ok {
+			a.A = parsedIP.To4()
+			packet.Answer[i] = a
+		}
+	}
+
+	packed, err := packet.Pack()
+	if err != nil {
+		return msg
+	}
+
+	return packed
+}
+
+func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
+	// Parse the DNS message
+	var msg dns.Msg
+	err := msg.Unpack(rawDNSResponse)
+	if err != nil {
+		return false, fmt.Errorf("failed to unpack DNS message: %v", err)
+	}
+
+	// Convert the slice of IP addresses to a map for quick lookup
+	ipMap := make(map[string]struct{})
+	for _, ip := range ipsToCheck {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			return false, fmt.Errorf("invalid IP address in the slice: %v", ip)
+		}
+		ipMap[parsedIP.String()] = struct{}{}
+	}
+
+	// Check if any answer contains an IP that matches one in the map
+	for _, answer := range msg.Answer {
+		if a, ok := answer.(*dns.A); ok {
+			if _, exists := ipMap[a.A.String()]; exists {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
