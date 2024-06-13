@@ -346,7 +346,8 @@ func logHistory(msg []byte) {
 	packet := new(dns.Msg)
 	err := packet.Unpack(msg)
 	if err != nil {
-		log.Println("Failed to unpack the message")
+		log.Println("Failed to unpack the message", err)
+		return
 	}
 
 	if len(packet.Question) == 0 {
@@ -361,14 +362,15 @@ func logHistory(msg []byte) {
 	historyLogURL := os.Getenv("HISTORY_URL")
 	req, err := http.NewRequest("GET", historyLogURL+"?name="+qname+"&type="+qtype, nil)
 	if err != nil {
-		log.Println("Could not build request for logging")
+		log.Println("Could not build request for logging", err)
 		return
 	}
 
 	client := &http.Client{}
 	_, err = client.Do(req)
 	if err != nil {
-		log.Println("Failed to log to history " + qname)
+		log.Println("Failed to log to history "+qname, err)
+		return
 	}
 	log.Println("Logged to history " + qname)
 }
