@@ -134,7 +134,7 @@ func SetMsgId(msg []byte, id uint16) []byte {
 }
 
 func handleClient(pc net.PacketConn, cache *Cache) {
-	buf := make([]byte, 2048)
+	buf := make([]byte, 4096)
 	n, addr, err := pc.ReadFrom(buf)
 
 	if err != nil {
@@ -146,7 +146,6 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 	dnsQuery := buf[:n]
 	cacheKey := GetDnsQuery(buf)
 	dohResponse := cache.Get(cacheKey)
-	go logHistory(dohResponse)
 
 	if dohResponse == nil {
 		// Forward the DNS query to the DoH server
@@ -166,6 +165,7 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 	} else {
 		dohResponse = SetMsgId(dohResponse, GetMsgId(buf))
 	}
+	go logHistory(dohResponse)
 
 	// Send the DoH response back to the client
 	_, err = pc.WriteTo(dohResponse, addr)
