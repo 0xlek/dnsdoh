@@ -4,22 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/joho/godotenv"
+	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/joho/godotenv"
-	"github.com/miekg/dns"
-	"github.com/redis/go-redis/v9"
 )
-
-const DNSMessageBufferSize = 64 << 20
-const MiekgMsgSize = math.MaxInt16
 
 type Cache struct {
 	client *redis.Client
@@ -72,16 +67,8 @@ func main() {
 	cache := Cache{client: rdb, expiry: cachePeriod}
 
 	udpAddress := os.Getenv("ADDRESS")
-	listenAddress, err := net.ResolveUDPAddr("udp", udpAddress)
-
-	if err != nil {
-		log.Println("Error: failed to parse udp listen address")
-	}
-
 	// Listen for incoming UDP packets
-	pc, err := net.ListenUDP("udp", listenAddress)
-	pc.SetReadBuffer(MiekgMsgSize)
-
+	pc, err := net.ListenPacket("udp", udpAddress)
 	if err != nil {
 		log.Printf("Error starting UDP listener: %v\n", err)
 		return
@@ -93,19 +80,18 @@ func main() {
 		go httpCacheRefresh(&cache)
 	}
 
-	log.Printf("Listening on %s\n", listenAddress)
+	log.Printf("Listening on %s\n", udpAddress)
 	for {
 		handleClient(pc, &cache)
 	}
 }
 
-func GetDnsQuery(msg *[]byte) string {
+func GetDnsQuery(msg []byte) string {
 	packet := new(dns.Msg)
-	packet.SetEdns0(MiekgMsgSize, true)
-	err := packet.Unpack(*msg)
+	err := packet.Unpack(msg)
 
 	if err != nil {
-		log.Println("Error: failed to unpack buffer to a msg struct")
+		log.Println("failed to unpack buffer to a msg struct")
 		return ""
 	}
 
@@ -117,26 +103,23 @@ func GetDnsQuery(msg *[]byte) string {
 	return question.String()
 }
 
-func GetMsgId(msg *[]byte) uint16 {
+func GetMsgId(msg []byte) uint16 {
 	packet := new(dns.Msg)
-	packet.SetEdns0(MiekgMsgSize, true)
-	err := packet.Unpack(*msg)
+	err := packet.Unpack(msg)
 
 	if err != nil {
-		log.Printf("Error: failed to unpack message")
+		log.Println("failed to unpack message")
 		return 0
 	}
 
 	return packet.Id
 }
 
-func SetMsgId(msg *[]byte, id uint16) *[]byte {
+func SetMsgId(msg []byte, id uint16) []byte {
 	packet := new(dns.Msg)
-	packet.SetEdns0(MiekgMsgSize, true)
-	err := packet.Unpack(*msg)
+	err := packet.Unpack(msg)
 
 	if err != nil {
-		log.Printf("Error: failed to unpack with error %v", err)
 		return msg
 	}
 
@@ -144,15 +127,14 @@ func SetMsgId(msg *[]byte, id uint16) *[]byte {
 	packed, err := packet.Pack()
 
 	if err != nil {
-		log.Printf("Error: to pack message %v", err)
 		return msg
 	}
 
-	return &packed
+	return packed
 }
 
-func handleClient(pc *net.UDPConn, cache *Cache) {
-	buf := make([]byte, DNSMessageBufferSize)
+func handleClient(pc net.PacketConn, cache *Cache) {
+	buf := make([]byte, 4096)
 	n, addr, err := pc.ReadFrom(buf)
 
 	if err != nil {
@@ -162,53 +144,40 @@ func handleClient(pc *net.UDPConn, cache *Cache) {
 
 	// Decode the DNS query
 	dnsQuery := buf[:n]
-	cacheKey := GetDnsQuery(&buf)
+	cacheKey := GetDnsQuery(buf)
 	dohResponse := cache.Get(cacheKey)
 
 	if dohResponse == nil {
 		// Forward the DNS query to the DoH server
-		dohResponse, err = queryDoH(&dnsQuery)
+		dohResponse, err = queryDoH(dnsQuery)
 		if err != nil {
 			log.Printf("Error querying DoH server: %v\n", err)
 			return
 		}
 
 		ips := strings.Split(os.Getenv("IP_TO_CATCH"), ",")
-		shouldReplace, _ := shouldReplaceIP(&dohResponse, ips)
+		shouldReplace, _ := shouldReplaceIP(dohResponse, ips)
 		if shouldReplace {
-			dohResponse = *answerWith(&dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
+			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
 		}
 
+		cache.Set(cacheKey, &dohResponse)
 	} else {
-		dohResponse = *SetMsgId(&dohResponse, GetMsgId(&buf))
+		dohResponse = SetMsgId(dohResponse, GetMsgId(buf))
 	}
-
-	defer logHistory(&dohResponse)
-
-	_, err = isDNSMessageValid(&dohResponse)
-	if err != nil {
-		log.Println(err)
-		reply, err := createServFailResponse(&buf)
-		if err != nil {
-			log.Printf("Error: %v", err)
-		}
-		_, err = pc.WriteTo(reply, addr)
-		return
-	}
+	go logHistory(dohResponse)
 
 	// Send the DoH response back to the client
 	_, err = pc.WriteTo(dohResponse, addr)
 	if err != nil {
 		fmt.Printf("Error sending response to client: %v\n", err)
-		return
 	}
-	cache.Set(cacheKey, &dohResponse)
 }
 
-func queryDoH(dnsQuery *[]byte) ([]byte, error) {
+func queryDoH(dnsQuery []byte) ([]byte, error) {
 	dohServerURL := os.Getenv("DOH_URL")
 	// Encode the DNS query in Base64URL format
-	encodedQuery := base64.RawURLEncoding.EncodeToString(*dnsQuery)
+	encodedQuery := base64.RawURLEncoding.EncodeToString(dnsQuery)
 
 	// Create the DoH request
 	req, err := http.NewRequest("GET", dohServerURL+"?dns="+encodedQuery, nil)
@@ -216,7 +185,7 @@ func queryDoH(dnsQuery *[]byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DoH request: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/dns-message")
+
 	req.Header.Set("Accept", "application/dns-message")
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -226,14 +195,6 @@ func queryDoH(dnsQuery *[]byte) ([]byte, error) {
 	}
 
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Println("Error: http to doh failed with not ok response")
-	}
-
-	if resp.Header.Get("Content-Type") != "application/dns-message" {
-		log.Printf("Invalid content type: %s\n", resp.Header.Get("Content-Type"))
-	}
 
 	// Read the DoH response
 	dohResponse, err := io.ReadAll(resp.Body)
@@ -245,10 +206,9 @@ func queryDoH(dnsQuery *[]byte) ([]byte, error) {
 	return dohResponse, nil
 }
 
-func answerWith(msg *[]byte, ip string) *[]byte {
+func answerWith(msg []byte, ip string) []byte {
 	packet := new(dns.Msg)
-	packet.SetEdns0(MiekgMsgSize, true)
-	err := packet.Unpack(*msg)
+	err := packet.Unpack(msg)
 
 	if err != nil {
 		return msg
@@ -272,14 +232,13 @@ func answerWith(msg *[]byte, ip string) *[]byte {
 		return msg
 	}
 
-	return &packed
+	return packed
 }
 
-func shouldReplaceIP(rawDNSResponse *[]byte, ipsToCheck []string) (bool, error) {
+func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
 	// Parse the DNS message
 	var msg dns.Msg
-	msg.SetEdns0(MiekgMsgSize, true)
-	err := msg.Unpack(*rawDNSResponse)
+	err := msg.Unpack(rawDNSResponse)
 	if err != nil {
 		return false, fmt.Errorf("failed to unpack DNS message: %v", err)
 	}
@@ -318,7 +277,6 @@ func httpCacheRefresh(cache *Cache) {
 		}
 
 		msg := new(dns.Msg)
-		msg.SetEdns0(MiekgMsgSize, true)
 
 		intQType, err := stringToType(qtype)
 		if err != nil {
@@ -337,19 +295,19 @@ func httpCacheRefresh(cache *Cache) {
 			return
 		}
 
-		dohResponse, err := queryDoH(&packedMsg)
+		dohResponse, err := queryDoH(packedMsg)
 		if err != nil {
 			log.Println("Failed to query DoH ", err)
 			return
 		}
 
 		ips := strings.Split(os.Getenv("IP_TO_CATCH"), ",")
-		shouldReplace, _ := shouldReplaceIP(&dohResponse, ips)
+		shouldReplace, _ := shouldReplaceIP(dohResponse, ips)
 		if shouldReplace {
-			dohResponse = *answerWith(&dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
+			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
 		}
 
-		cacheKey := GetDnsQuery(&dohResponse)
+		cacheKey := GetDnsQuery(dohResponse)
 		cache.Set(cacheKey, &dohResponse)
 		log.Println("Updated successfully " + name)
 		fmt.Fprintf(w, "Updated successfully %s", name)
@@ -379,17 +337,14 @@ func stringToType(qtype string) (uint16, error) {
 		return dns.TypeSOA, nil
 	case "PTR":
 		return dns.TypePTR, nil
-	case "HTTPS":
-		return dns.TypeHTTPS, nil
 	default:
 		return 0, fmt.Errorf("unsupported query type: %s", qtype)
 	}
 }
 
-func logHistory(msg *[]byte) {
+func logHistory(msg []byte) {
 	packet := new(dns.Msg)
-	packet.SetEdns0(MiekgMsgSize, true)
-	err := packet.Unpack(*msg)
+	err := packet.Unpack(msg)
 	if err != nil {
 		log.Println("Failed to unpack the message", err)
 		return
@@ -418,43 +373,4 @@ func logHistory(msg *[]byte) {
 		return
 	}
 	log.Println("Logged to history " + qname)
-}
-
-func isDNSMessageValid(msgBytes *[]byte) (bool, error) {
-	msg := new(dns.Msg)
-	err := msg.Unpack(*msgBytes)
-
-	if err != nil {
-		return false, fmt.Errorf("failed to unpack DNS message: %v", err)
-	}
-
-	if len(msg.Question) == 0 {
-		return false, fmt.Errorf("DNS message has no questions")
-	}
-
-	if msg.MsgHdr.Response && len(msg.Answer) == 0 {
-		return false, fmt.Errorf("DNS response contains no answers")
-	}
-
-	return true, nil
-}
-
-func createServFailResponse(queryBuf *[]byte) ([]byte, error) {
-	queryMsg := new(dns.Msg)
-	err := queryMsg.Unpack(*queryBuf)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to unpack DNS query: %v", err)
-	}
-
-	responseMsg := new(dns.Msg)
-	responseMsg.SetReply(queryMsg)
-	responseMsg.Rcode = dns.RcodeServerFailure
-	responseBuf, err := responseMsg.Pack()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to pack DNS SERVFAIL response: %v", err)
-	}
-
-	return responseBuf, nil
 }
