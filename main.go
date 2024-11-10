@@ -21,9 +21,9 @@ type Cache struct {
 	expiry time.Duration
 }
 
-func (c *Cache) Get(name string) []byte {
+func (c *Cache) Get(ctx context.Context, name string) []byte {
 	fmt.Println(name)
-	msg, err := c.client.Get(context.Background(), name).Bytes()
+	msg, err := c.client.Get(ctx, name).Bytes()
 
 	if err != nil {
 		log.Println("miss cache ", name)
@@ -33,13 +33,15 @@ func (c *Cache) Get(name string) []byte {
 	return msg
 }
 
-func (c *Cache) Set(name string, response *[]byte) {
-	err := c.client.Set(context.Background(), name, *response, c.expiry).Err()
+func (c *Cache) Set(ctx context.Context, name string, response *[]byte) {
+	err := c.client.Set(ctx, name, *response, c.expiry).Err()
 
 	if err != nil {
 		log.Println("failed to cache")
 	}
 }
+
+var sharedClient = &http.Client{} // Shared HTTP client
 
 func main() {
 	err := godotenv.Load()
@@ -67,13 +69,11 @@ func main() {
 	cache := Cache{client: rdb, expiry: cachePeriod}
 
 	udpAddress := os.Getenv("ADDRESS")
-	// Listen for incoming UDP packets
 	pc, err := net.ListenPacket("udp", udpAddress)
 	if err != nil {
 		log.Printf("Error starting UDP listener: %v\n", err)
 		return
 	}
-
 	defer pc.Close()
 
 	if os.Getenv("REFRESH_INSTANCE") == "true" {
@@ -142,13 +142,12 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 		return
 	}
 
-	// Decode the DNS query
 	dnsQuery := buf[:n]
 	cacheKey := GetDnsQuery(buf)
-	dohResponse := cache.Get(cacheKey)
+	ctx := context.Background()
+	dohResponse := cache.Get(ctx, cacheKey)
 
 	if dohResponse == nil {
-		// Forward the DNS query to the DoH server
 		dohResponse, err = queryDoH(dnsQuery)
 		if err != nil {
 			log.Printf("Error querying DoH server: %v\n", err)
@@ -161,13 +160,12 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
 		}
 
-		cache.Set(cacheKey, &dohResponse)
+		cache.Set(ctx, cacheKey, &dohResponse)
 	} else {
 		dohResponse = SetMsgId(dohResponse, GetMsgId(buf))
 	}
 	go logHistory(dohResponse)
 
-	// Send the DoH response back to the client
 	_, err = pc.WriteTo(dohResponse, addr)
 	if err != nil {
 		fmt.Printf("Error sending response to client: %v\n", err)
@@ -176,29 +174,21 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 
 func queryDoH(dnsQuery []byte) ([]byte, error) {
 	dohServerURL := os.Getenv("DOH_URL")
-	// Encode the DNS query in Base64URL format
 	encodedQuery := base64.RawURLEncoding.EncodeToString(dnsQuery)
 
-	// Create the DoH request
 	req, err := http.NewRequest("GET", dohServerURL+"?dns="+encodedQuery, nil)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DoH request: %v", err)
 	}
 
 	req.Header.Set("Accept", "application/dns-message")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-
+	resp, err := sharedClient.Do(req) // Use shared HTTP client
 	if err != nil {
 		return nil, fmt.Errorf("DoH request failed: %v", err)
 	}
-
 	defer resp.Body.Close()
 
-	// Read the DoH response
 	dohResponse, err := io.ReadAll(resp.Body)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to read DoH response: %v", err)
 	}
@@ -236,14 +226,12 @@ func answerWith(msg []byte, ip string) []byte {
 }
 
 func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
-	// Parse the DNS message
 	var msg dns.Msg
 	err := msg.Unpack(rawDNSResponse)
 	if err != nil {
 		return false, fmt.Errorf("failed to unpack DNS message: %v", err)
 	}
 
-	// Convert the slice of IP addresses to a map for quick lookup
 	ipMap := make(map[string]struct{})
 	for _, ip := range ipsToCheck {
 		parsedIP := net.ParseIP(ip)
@@ -253,7 +241,6 @@ func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
 		ipMap[parsedIP.String()] = struct{}{}
 	}
 
-	// Check if any answer contains an IP that matches one in the map
 	for _, answer := range msg.Answer {
 		if a, ok := answer.(*dns.A); ok {
 			if _, exists := ipMap[a.A.String()]; exists {
@@ -283,10 +270,8 @@ func httpCacheRefresh(cache *Cache) {
 			log.Println("Wrong query type", err)
 			return
 		}
-		// Set the DNS message header
-		msg.SetQuestion(dns.Fqdn(name), intQType)
 
-		// Optional: Set the message ID, recursion desired, etc.
+		msg.SetQuestion(dns.Fqdn(name), intQType)
 		msg.Id = dns.Id()
 		msg.RecursionDesired = true
 		packedMsg, err := msg.Pack()
@@ -307,8 +292,9 @@ func httpCacheRefresh(cache *Cache) {
 			dohResponse = answerWith(dohResponse, os.Getenv("IP_TO_REPLACE_WITH"))
 		}
 
+		ctx := context.Background()
 		cacheKey := GetDnsQuery(dohResponse)
-		cache.Set(cacheKey, &dohResponse)
+		cache.Set(ctx, cacheKey, &dohResponse)
 		log.Println("Updated successfully " + name)
 		fmt.Fprintf(w, "Updated successfully %s", name)
 	}
@@ -366,8 +352,7 @@ func logHistory(msg []byte) {
 		return
 	}
 
-	client := &http.Client{}
-	_, err = client.Do(req)
+	_, err = sharedClient.Do(req) // Use shared HTTP client
 	if err != nil {
 		log.Println("Failed to log to history "+qname, err)
 		return
