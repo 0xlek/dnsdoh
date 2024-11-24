@@ -402,7 +402,7 @@ func logHistory(msg []byte) {
 	if historyLogURL == "" {
 		return
 	}
-	packet := new(dns.Msg)
+
 	packet := getPacket()
 	defer putPacket(packet)
 
@@ -432,10 +432,12 @@ func logHistory(msg []byte) {
 		log.Println("Failed to log to history "+qname, err)
 		return
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Unexpected status code while logging to history %s: %d", qname, resp.StatusCode)
 	}
+
 	log.Println("Logged to history " + qname)
 }
