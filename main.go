@@ -176,6 +176,7 @@ func handleClient(pc net.PacketConn, cache *Cache) {
 
 	if dohResponse == nil {
 		dohResponse, err = queryDoH(dnsQuery)
+		dohResponse = updateTtl(dohResponse, cache)
 		if err != nil {
 			log.Printf("Error querying DoH server: %v\n", err)
 			return
@@ -223,6 +224,33 @@ func queryDoH(dnsQuery []byte) ([]byte, error) {
 	dohResponse := buf.Bytes()
 
 	return dohResponse, nil
+}
+
+func updateTtl(msg []byte, c *Cache) []byte {
+	packet := new(dns.Msg)
+	err := packet.Unpack(msg)
+
+	if err != nil {
+		return msg
+	}
+	ttl := uint32(c.expiry.Seconds())
+
+	for _, answer := range packet.Answer {
+		if a, ok := answer.(*dns.A); ok {
+			a.Hdr.Ttl = ttl
+		}
+	}
+
+	packet.Authoritative = true
+
+	data, err := packet.Pack()
+	if err != nil {
+		log.Println("failed to update ttl of the message")
+		return msg
+	}
+
+	return data
+
 }
 
 func answerWith(msg []byte, ip string) []byte {
@@ -316,6 +344,8 @@ func httpCacheRefresh(cache *Cache) {
 		}
 
 		dohResponse, err := queryDoH(packedMsg)
+		dohResponse = updateTtl(dohResponse, cache)
+
 		if err != nil {
 			log.Println("Failed to query DoH ", err)
 			return
@@ -360,12 +390,19 @@ func stringToType(qtype string) (uint16, error) {
 		return dns.TypeSOA, nil
 	case "PTR":
 		return dns.TypePTR, nil
+	case "HTTPS":
+		return dns.TypeHTTPS, nil
 	default:
 		return 0, fmt.Errorf("unsupported query type: %s", qtype)
 	}
 }
 
 func logHistory(msg []byte) {
+	historyLogURL := os.Getenv("HISTORY_URL")
+	if historyLogURL == "" {
+		return
+	}
+
 	packet := getPacket()
 	defer putPacket(packet)
 
@@ -384,7 +421,6 @@ func logHistory(msg []byte) {
 	qname := question.Name
 	qtype := dns.TypeToString[question.Qtype]
 
-	historyLogURL := os.Getenv("HISTORY_URL")
 	req, err := http.NewRequest("GET", historyLogURL+"?name="+qname+"&type="+qtype, nil)
 	if err != nil {
 		log.Println("Could not build request for logging", err)
@@ -396,10 +432,12 @@ func logHistory(msg []byte) {
 		log.Println("Failed to log to history "+qname, err)
 		return
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Unexpected status code while logging to history %s: %d", qname, resp.StatusCode)
 	}
+
 	log.Println("Logged to history " + qname)
 }
