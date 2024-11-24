@@ -1,19 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/joho/godotenv"
-	"github.com/miekg/dns"
-	"github.com/redis/go-redis/v9"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/miekg/dns"
+	"github.com/redis/go-redis/v9"
 )
 
 type Cache struct {
@@ -42,6 +45,29 @@ func (c *Cache) Set(ctx context.Context, name string, response *[]byte) {
 }
 
 var sharedClient = &http.Client{} // Shared HTTP client
+var packetPool = sync.Pool{
+	New: func() interface{} {
+		return new(dns.Msg)
+	},
+}
+
+func getPacket() *dns.Msg {
+	return packetPool.Get().(*dns.Msg)
+}
+
+func putPacket(msg *dns.Msg) {
+	resetPacket(msg)
+	packetPool.Put(msg)
+}
+
+func resetPacket(msg *dns.Msg) {
+	msg.MsgHdr = dns.MsgHdr{}
+	msg.Compress = false
+	msg.Question = nil
+	msg.Answer = nil
+	msg.Ns = nil
+	msg.Extra = nil
+}
 
 func main() {
 	err := godotenv.Load()
@@ -87,9 +113,10 @@ func main() {
 }
 
 func GetDnsQuery(msg []byte) string {
-	packet := new(dns.Msg)
-	err := packet.Unpack(msg)
+	packet := getPacket()
+	defer putPacket(packet)
 
+	err := packet.Unpack(msg)
 	if err != nil {
 		log.Println("failed to unpack buffer to a msg struct")
 		return ""
@@ -104,9 +131,10 @@ func GetDnsQuery(msg []byte) string {
 }
 
 func GetMsgId(msg []byte) uint16 {
-	packet := new(dns.Msg)
-	err := packet.Unpack(msg)
+	packet := getPacket()
+	defer putPacket(packet)
 
+	err := packet.Unpack(msg)
 	if err != nil {
 		log.Println("failed to unpack message")
 		return 0
@@ -116,16 +144,16 @@ func GetMsgId(msg []byte) uint16 {
 }
 
 func SetMsgId(msg []byte, id uint16) []byte {
-	packet := new(dns.Msg)
-	err := packet.Unpack(msg)
+	packet := getPacket()
+	defer putPacket(packet)
 
+	err := packet.Unpack(msg)
 	if err != nil {
 		return msg
 	}
 
 	packet.Id = id
 	packed, err := packet.Pack()
-
 	if err != nil {
 		return msg
 	}
@@ -136,7 +164,6 @@ func SetMsgId(msg []byte, id uint16) []byte {
 func handleClient(pc net.PacketConn, cache *Cache) {
 	buf := make([]byte, 4096)
 	n, addr, err := pc.ReadFrom(buf)
-
 	if err != nil {
 		log.Printf("Error reading UDP packet: %v\n", err)
 		return
@@ -183,16 +210,18 @@ func queryDoH(dnsQuery []byte) ([]byte, error) {
 	}
 
 	req.Header.Set("Accept", "application/dns-message")
-	resp, err := sharedClient.Do(req) // Use shared HTTP client
+	resp, err := sharedClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("DoH request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	dohResponse, err := io.ReadAll(resp.Body)
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read DoH response: %v", err)
 	}
+	dohResponse := buf.Bytes()
 
 	return dohResponse, nil
 }
@@ -225,9 +254,10 @@ func updateTtl(msg []byte, c *Cache) []byte {
 }
 
 func answerWith(msg []byte, ip string) []byte {
-	packet := new(dns.Msg)
-	err := packet.Unpack(msg)
+	packet := getPacket()
+	defer putPacket(packet)
 
+	err := packet.Unpack(msg)
 	if err != nil {
 		return msg
 	}
@@ -281,7 +311,11 @@ func shouldReplaceIP(rawDNSResponse []byte, ipsToCheck []string) (bool, error) {
 }
 
 func httpCacheRefresh(cache *Cache) {
+	var wg sync.WaitGroup
 	recordHandler := func(w http.ResponseWriter, req *http.Request) {
+		wg.Add(1)
+		defer wg.Done()
+
 		q := req.URL.Query()
 		name := q.Get("name")
 		qtype := q.Get("type")
@@ -291,7 +325,8 @@ func httpCacheRefresh(cache *Cache) {
 			return
 		}
 
-		msg := new(dns.Msg)
+		msg := getPacket()
+		defer putPacket(msg)
 
 		intQType, err := stringToType(qtype)
 		if err != nil {
@@ -333,6 +368,8 @@ func httpCacheRefresh(cache *Cache) {
 
 	log.Printf("Listening on %s\n", "0.0.0.0:8083")
 	log.Fatal(http.ListenAndServe(":8083", nil))
+
+	wg.Wait()
 }
 
 func stringToType(qtype string) (uint16, error) {
@@ -366,6 +403,9 @@ func logHistory(msg []byte) {
 		return
 	}
 	packet := new(dns.Msg)
+	packet := getPacket()
+	defer putPacket(packet)
+
 	err := packet.Unpack(msg)
 	if err != nil {
 		log.Println("Failed to unpack the message", err)
@@ -387,10 +427,15 @@ func logHistory(msg []byte) {
 		return
 	}
 
-	_, err = sharedClient.Do(req) // Use shared HTTP client
+	resp, err := sharedClient.Do(req)
 	if err != nil {
 		log.Println("Failed to log to history "+qname, err)
 		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Unexpected status code while logging to history %s: %d", qname, resp.StatusCode)
 	}
 	log.Println("Logged to history " + qname)
 }
