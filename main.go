@@ -241,8 +241,6 @@ func updateTtl(msg []byte, c *Cache) []byte {
 		}
 	}
 
-	packet.Authoritative = true
-
 	data, err := packet.Pack()
 	if err != nil {
 		log.Println("failed to update ttl of the message")
