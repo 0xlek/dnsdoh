@@ -20,12 +20,17 @@ import (
 )
 
 type Cache struct {
-	client *redis.Client
-	expiry time.Duration
+	client    *redis.Client
+	expiry    time.Duration
+	Available bool
 }
 
 func (c *Cache) Get(ctx context.Context, name string) []byte {
-	fmt.Println(name)
+	if !c.Available {
+		fmt.Println("cache is not available")
+		return nil
+	}
+
 	msg, err := c.client.Get(ctx, name).Bytes()
 
 	if err != nil {
@@ -37,6 +42,11 @@ func (c *Cache) Get(ctx context.Context, name string) []byte {
 }
 
 func (c *Cache) Set(ctx context.Context, name string, response *[]byte) {
+	if !c.Available {
+		fmt.Println("cache is not available")
+		return
+	}
+
 	err := c.client.Set(ctx, name, *response, c.expiry).Err()
 
 	if err != nil {
@@ -83,16 +93,18 @@ func main() {
 		DB:       0,
 	})
 
+	cacheAvailable := true
 	_, err = rdb.Ping(context.Background()).Result()
 	if err != nil {
-		panic(err)
+		fmt.Println(err)
+		cacheAvailable = false
 	}
 
 	cachePeriod, err := time.ParseDuration(os.Getenv("CACHE_PERIOD"))
 	if err != nil {
 		panic(err)
 	}
-	cache := Cache{client: rdb, expiry: cachePeriod}
+	cache := Cache{client: rdb, expiry: cachePeriod, Available: cacheAvailable}
 
 	udpAddress := os.Getenv("ADDRESS")
 	pc, err := net.ListenPacket("udp", udpAddress)
